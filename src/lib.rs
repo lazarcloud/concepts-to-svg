@@ -220,6 +220,14 @@ fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
         bail!("stroke UUID has invalid length {}", uuid.len());
     }
     let id = format_uuid(uuid);
+    let transform = extension(
+        required(style, 7, "stroke transform")?,
+        7,
+        "stroke transform",
+    )?;
+    if !is_identity_transform(transform) {
+        bail!("stroke {id} has a non-identity transform that is not yet supported");
+    }
     let rgba = extension(required(color_fields, 2, "stroke RGBA")?, 4, "stroke RGBA")?;
     if rgba.len() != 16 {
         bail!("stroke RGBA has invalid length {}", rgba.len());
@@ -470,6 +478,21 @@ fn color_channel(channel: f32) -> u8 {
     (channel.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+fn is_identity_transform(bytes: &[u8]) -> bool {
+    if bytes.len() != 16 * 4 {
+        return false;
+    }
+    let identity = [
+        1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    bytes
+        .chunks_exact(4)
+        .zip(identity)
+        .all(|(bytes, expected)| {
+            f32::from_le_bytes(bytes.try_into().expect("four-byte float")) == expected
+        })
+}
+
 fn format_num(value: f32) -> String {
     let rounded = (value * 1000.0).round() / 1000.0;
     if rounded == 0.0 {
@@ -707,6 +730,12 @@ mod tests {
             Value::F32(0.0),
         ]);
         let style_group = msg_array([msg_int(1), parameters]);
+        let identity = [
+            1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
         let style = msg_array([
             msg_int(3),
             style_group,
@@ -715,7 +744,7 @@ mod tests {
             Value::Nil,
             msg_int(0),
             Value::F64(0.0),
-            msg_ext(7, &[0; 64]),
+            msg_ext(7, &identity),
             Value::Boolean(false),
             msg_int(17_038_118),
         ]);
