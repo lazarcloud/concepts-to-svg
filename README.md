@@ -7,12 +7,12 @@ cargo run -- drawing.concepts
 cargo run -- drawing.concepts --output drawing-preview.svg
 ```
 
-The current exporter embeds the archive's `thumb.jpg` inside the SVG. This
-preserves the drawing's preview appearance at thumbnail resolution and works
-with the current sample files, but the result is a raster image wrapped in
-SVG—not editable or resolution-independent vector paths. Concepts stores stroke
-data in a packed binary format; decoding that geometry is future work. The CLI
-refuses to overwrite the default `.svg` output if it already exists; pass
-`--output` to choose an explicit path.
+The exporter decodes the current `tree.pack` MessagePack records and writes
+stroke paths, dots, layers, colors, opacity, and a solid background as SVG.
+Unknown object records fall back to the embedded `thumb.jpg`, preserving the
+preview at thumbnail resolution rather than silently dropping content. Curves
+are reconstructed from the stored point samples, so unusual brushes may differ
+from Concepts' own SVG exporter. The CLI refuses to overwrite the default
+`.svg` output if it already exists; pass `--output` to choose an explicit path.
 
 Run tests with `cargo test`.

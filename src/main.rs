@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Wrap a Concepts drawing thumbnail in an SVG file")]
+#[command(version, about = "Convert Concepts drawings to SVG")]
 struct Args {
     /// Input .concepts file
     input: PathBuf,
@@ -31,9 +31,9 @@ fn main() -> Result<()> {
         );
     }
 
-    concepts_to_svg::convert_file(&args.input, &output)
+    let kind = concepts_to_svg::convert_file(&args.input, &output)
         .with_context(|| format!("converting {}", args.input.display()))?;
-    println!("Wrote {}", output.display());
+    println!("Wrote {} ({kind})", output.display());
     Ok(())
 }
 
