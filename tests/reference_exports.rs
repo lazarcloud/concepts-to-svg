@@ -1,9 +1,7 @@
-use std::{collections::BTreeMap, fs, io::Read, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use concepts_to_svg::{ConversionKind, convert_file};
 use roxmltree::{Document, Node};
-use zip::ZipArchive;
 
 const GEOMETRY_TOLERANCE: f64 = 1.0;
 
@@ -27,7 +25,6 @@ fn generated_svgs_match_paired_exports_on_disk() {
 
     let output_dir = tempfile::tempdir().unwrap();
     let mut vector_comparisons = 0;
-    let mut raster_fallbacks = 0;
 
     for (index, archive) in archives.iter().enumerate() {
         let reference_path = archive.with_extension("svg");
@@ -47,22 +44,8 @@ fn generated_svgs_match_paired_exports_on_disk() {
                 compare_viewbox_aspect_ratio(&reference, &generated, archive);
             }
             ConversionKind::ThumbnailFallback => {
-                raster_fallbacks += 1;
-                let image = generated
-                    .descendants()
-                    .find(|node| node.tag_name().name() == "image")
-                    .expect("thumbnail fallback must have an SVG image element");
-                let href = image.attribute("href").unwrap();
-                let encoded = href.strip_prefix("data:image/jpeg;base64,").unwrap();
-                let embedded = STANDARD.decode(encoded).unwrap();
-                let mut input = ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
-                let mut thumbnail = input.by_name("thumb.jpg").unwrap();
-                let mut expected_thumbnail = Vec::new();
-                thumbnail.read_to_end(&mut expected_thumbnail).unwrap();
-                assert_eq!(
-                    embedded,
-                    expected_thumbnail,
-                    "fallback thumbnail for {}",
+                panic!(
+                    "{} converted via thumbnail fallback; paired-reference tests require vector output",
                     archive.display()
                 );
             }
@@ -73,9 +56,7 @@ fn generated_svgs_match_paired_exports_on_disk() {
         vector_comparisons > 0,
         "paired reference files were found, but none exercised vector conversion"
     );
-    eprintln!(
-        "compared {vector_comparisons} vector export(s) and verified {raster_fallbacks} thumbnail fallback(s) against on-disk references"
-    );
+    eprintln!("compared {vector_comparisons} vector export(s) against on-disk references");
 }
 
 fn compare_background<'a, 'input>(

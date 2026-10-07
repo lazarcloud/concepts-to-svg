@@ -18,5 +18,6 @@ from Concepts' own SVG exporter. The CLI refuses to overwrite the default
 Run tests with `cargo test`. When paired `.concepts`/`.svg` references are
 present in the project root, an integration test compares layer/object IDs,
 styles, and sampled path geometry (within 1 drawing unit); it also verifies
-that fallback SVGs embed the archive thumbnail unchanged. That comparison is
-skipped when no paired files are available.
+that every paired input converted through the vector path. Any thumbnail
+fallback fails the comparison test. The test is skipped when no paired files
+are available.

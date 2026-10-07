@@ -39,7 +39,27 @@ struct Stroke {
     color: String,
     width: f32,
     opacity: f32,
+    closed: bool,
     points: Vec<Point>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AffineTransform {
+    m11: f32,
+    m12: f32,
+    m21: f32,
+    m22: f32,
+    m41: f32,
+    m42: f32,
+}
+
+impl AffineTransform {
+    fn apply(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            x * self.m11 + y * self.m21 + self.m41,
+            x * self.m12 + y * self.m22 + self.m42,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -220,14 +240,11 @@ fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
         bail!("stroke UUID has invalid length {}", uuid.len());
     }
     let id = format_uuid(uuid);
-    let transform = extension(
+    let transform = parse_transform(extension(
         required(style, 7, "stroke transform")?,
         7,
         "stroke transform",
-    )?;
-    if !is_identity_transform(transform) {
-        bail!("stroke {id} has a non-identity transform that is not yet supported");
-    }
+    )?)?;
     let rgba = extension(required(color_fields, 2, "stroke RGBA")?, 4, "stroke RGBA")?;
     if rgba.len() != 16 {
         bail!("stroke RGBA has invalid length {}", rgba.len());
@@ -266,21 +283,67 @@ fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
     }
     let mut points = Vec::with_capacity(point_bytes.len() / POINT_RECORD_SIZE);
     for record in point_bytes.chunks_exact(POINT_RECORD_SIZE) {
-        let x = f32::from_le_bytes(record[0..4].try_into().expect("four-byte x"));
+        let source_x = f32::from_le_bytes(record[0..4].try_into().expect("four-byte x"));
         let source_y = f32::from_le_bytes(record[4..8].try_into().expect("four-byte y"));
-        let y = SVG_Y_FLIP - source_y;
+        let (x, transformed_y) = transform.apply(source_x, source_y);
+        let y = SVG_Y_FLIP - transformed_y;
         if !x.is_finite() || !y.is_finite() {
             bail!("stroke point contains a non-finite coordinate");
         }
         points.push(Point { x, y });
     }
 
+    let shape_data = array(
+        required(fields, 16, "stroke shape metadata")?,
+        "stroke shape metadata",
+    )?;
+    let closed = points.len() >= 3 && shape_data.len() == points.len() + 1;
+
     Ok(Stroke {
         id,
         color,
         width,
         opacity,
+        closed,
         points,
+    })
+}
+
+fn parse_transform(bytes: &[u8]) -> Result<AffineTransform> {
+    if bytes.len() != 16 * 4 {
+        bail!("stroke transform has invalid length {}", bytes.len());
+    }
+    let values = bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte float")))
+        .collect::<Vec<_>>();
+    if values.iter().any(|value| !value.is_finite()) {
+        bail!("stroke transform contains a non-finite value");
+    }
+    // Stored as a System.Numerics row-vector 4x4 affine transform.
+    for (index, expected) in [
+        (2, 0.0),
+        (3, 0.0),
+        (6, 0.0),
+        (7, 0.0),
+        (8, 0.0),
+        (9, 0.0),
+        (10, 1.0),
+        (11, 0.0),
+        (14, 0.0),
+        (15, 1.0),
+    ] {
+        if (values[index] - expected).abs() > 1e-6 {
+            bail!("stroke transform is not a 2D affine matrix");
+        }
+    }
+    Ok(AffineTransform {
+        m11: values[0],
+        m12: values[1],
+        m21: values[4],
+        m22: values[5],
+        m41: values[12],
+        m42: values[13],
     })
 }
 
@@ -362,7 +425,7 @@ fn write_stroke(svg: &mut String, stroke: &Stroke) -> Result<()> {
         let point = &stroke.points[0];
         writeln!(
             svg,
-            "    <circle id=\"{id}\" opacity=\"1.000\" fill=\"{}\" stroke=\"{}\" stroke-width=\"0.1\" stroke-opacity=\"{opacity}\" fill-opacity=\"{opacity}\" cx=\"{}\" cy=\"{}\" r=\"{}\" />",
+            "    <circle id=\"{id}\" opacity=\"{opacity}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"0.1\" stroke-opacity=\"{opacity}\" fill-opacity=\"{opacity}\" cx=\"{}\" cy=\"{}\" r=\"{}\" />",
             stroke.color,
             stroke.color,
             format_num(point.x),
@@ -377,13 +440,18 @@ fn write_stroke(svg: &mut String, stroke: &Stroke) -> Result<()> {
 
     write!(
         svg,
-        "    <path id=\"{id}\" opacity=\"1.000\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" stroke-opacity=\"{opacity}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M {} {}",
+        "    <path id=\"{id}\" opacity=\"{opacity}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" stroke-opacity=\"{opacity}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M {} {}",
         stroke.color,
         format_num(stroke.width),
         format_num(stroke.points[0].x),
         format_num(stroke.points[0].y)
     )?;
-    if stroke.points.len() == 2 {
+    if stroke.closed {
+        for point in stroke.points.iter().skip(1) {
+            write!(svg, " L {} {}", format_num(point.x), format_num(point.y))?;
+        }
+        write!(svg, " Z")?;
+    } else if stroke.points.len() == 2 {
         write!(
             svg,
             " L {} {}",
@@ -476,21 +544,6 @@ fn format_uuid(bytes: &[u8]) -> String {
 
 fn color_channel(channel: f32) -> u8 {
     (channel.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
-fn is_identity_transform(bytes: &[u8]) -> bool {
-    if bytes.len() != 16 * 4 {
-        return false;
-    }
-    let identity = [
-        1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-    ];
-    bytes
-        .chunks_exact(4)
-        .zip(identity)
-        .all(|(bytes, expected)| {
-            f32::from_le_bytes(bytes.try_into().expect("four-byte float")) == expected
-        })
 }
 
 fn format_num(value: f32) -> String {
@@ -614,7 +667,8 @@ mod tests {
     use zip::{ZipWriter, write::SimpleFileOptions};
 
     use super::{
-        ConversionKind, convert_file, jpeg_dimensions, parse_tree, thumbnail_svg, vector_svg,
+        ConversionKind, SVG_Y_FLIP, convert_file, jpeg_dimensions, parse_transform, parse_tree,
+        thumbnail_svg, vector_svg,
     };
     use rmpv::Value;
 
@@ -854,6 +908,36 @@ mod tests {
         let svg = vector_svg(&drawing).unwrap();
         assert!(svg.contains("stroke-width=\"2.500\""));
         assert!(svg.contains("stroke-opacity=\"0.694\""));
+    }
+
+    #[test]
+    fn applies_stored_row_vector_affine_transform_before_svg_y_flip() {
+        let values = [
+            1.096_863_6_f32,
+            -0.831_043_24,
+            0.0,
+            0.0,
+            0.831_043_24,
+            1.096_863_6,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            271.291_6,
+            69.725_91,
+            0.0,
+            1.0,
+        ];
+        let bytes = values
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let transform = parse_transform(&bytes).unwrap();
+        let (x, y) = transform.apply(66.481_05, -343.740_4);
+        assert!((x - 58.549).abs() < 0.001);
+        assert!((SVG_Y_FLIP - y - 1130.559).abs() < 0.001);
     }
 
     #[test]
