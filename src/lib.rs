@@ -11,6 +11,9 @@ const METADATA_PATH: &str = "metadata.json";
 const POINT_RECORD_SIZE: usize = 16;
 const SVG_Y_FLIP: f32 = 768.0;
 const SVG_MILLIMETERS_PER_UNIT: f32 = 0.192_424;
+// The observed Concepts text record does not carry explicit font metrics.
+const TEXT_FONT_SIZE: f32 = 24.0;
+const TEXT_ORIGIN_Y_OFFSET: f32 = -9.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversionKind {
@@ -62,9 +65,19 @@ struct EmbeddedImage {
 }
 
 #[derive(Debug)]
+struct Text {
+    id: String,
+    content: String,
+    color: String,
+    opacity: f32,
+    transform: PlanarTransform,
+}
+
+#[derive(Debug)]
 enum DrawingObject {
     Stroke(Stroke),
     Image(EmbeddedImage),
+    Text(Text),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,6 +111,21 @@ impl PlanarTransform {
 
     fn is_affine(self) -> bool {
         self.m14.abs() <= 1e-6 && self.m24.abs() <= 1e-6 && self.m44.abs() > f32::EPSILON
+    }
+
+    fn apply_svg(self, x: f32, y: f32) -> Result<(f32, f32)> {
+        if !self.is_affine() {
+            bail!("text has a projective transform that SVG text cannot represent");
+        }
+        let denominator = self.m44;
+        let transformed = (
+            (x * self.m11 - y * self.m21 + self.m41) / denominator,
+            (-x * self.m12 + y * self.m22) / denominator + SVG_Y_FLIP - self.m42 / denominator,
+        );
+        if !transformed.0.is_finite() || !transformed.1.is_finite() {
+            bail!("text transform produces a non-finite point");
+        }
+        Ok(transformed)
     }
 }
 
@@ -287,6 +315,7 @@ fn layer_name(value: Option<&rmpv::Value>, index: usize) -> String {
         Some(7) => "Airbrush".to_owned(),
         Some(9) => "Pen".to_owned(),
         Some(10) => "Wire".to_owned(),
+        Some(11) => "Text".to_owned(),
         _ if index == 0 => "Pen".to_owned(),
         _ => format!("Layer {}", index + 1),
     }
@@ -301,8 +330,72 @@ where
     match object_type {
         3 | 4 | 5 | 6 | 9 | 10 | 11 | 15 | 4096 => parse_stroke(object).map(DrawingObject::Stroke),
         7 => parse_image(object, read_resource).map(DrawingObject::Image),
+        13 => parse_text(object).map(DrawingObject::Text),
         _ => bail!("unsupported drawing object type {object_type}"),
     }
+}
+
+fn parse_text(object: &rmpv::Value) -> Result<Text> {
+    let object_fields = array(object, "text object")?;
+    let body = array(
+        required(object_fields, 1, "text object body")?,
+        "text object body",
+    )?;
+    let node = array(required(body, 1, "text node")?, "text node")?;
+    if integer(required(node, 0, "text node type")?)? != 3 {
+        bail!("unsupported text node type");
+    }
+
+    let id_bytes = extension(required(node, 2, "text UUID")?, 5, "text UUID")?;
+    if id_bytes.len() != 16 {
+        bail!("text UUID has invalid length {}", id_bytes.len());
+    }
+
+    let style = array(required(node, 1, "text style")?, "text style")?;
+    if integer(required(style, 0, "text style type")?)? != 4 {
+        bail!("unsupported text style type");
+    }
+    let style_body = array(required(style, 1, "text style body")?, "text style body")?;
+    let color_fields = array(required(style_body, 1, "text color")?, "text color")?;
+    let rgba = extension(required(color_fields, 2, "text RGBA")?, 4, "text RGBA")?;
+    if rgba.len() != 16 {
+        bail!("text RGBA has invalid length {}", rgba.len());
+    }
+    let channels = rgba
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte channel")))
+        .collect::<Vec<_>>();
+    if channels.iter().any(|channel| !channel.is_finite()) {
+        bail!("text color contains a non-finite channel");
+    }
+    let color = format!(
+        "#{:02x}{:02x}{:02x}",
+        color_channel(channels[0]),
+        color_channel(channels[1]),
+        color_channel(channels[2])
+    );
+    let opacity = number(required(color_fields, 3, "text opacity")?)?.clamp(0.0, 1.0)
+        * channels[3].clamp(0.0, 1.0);
+    let content = required(body, 2, "text content")?
+        .as_str()
+        .context("text content is not a UTF-8 string")?
+        .to_owned();
+    let transform = parse_transform(extension(
+        required(node, 7, "text transform")?,
+        7,
+        "text transform",
+    )?)?;
+    if !transform.is_affine() {
+        bail!("text has a projective transform that SVG text cannot represent");
+    }
+
+    Ok(Text {
+        id: format_uuid(id_bytes),
+        content,
+        color,
+        opacity,
+        transform,
+    })
 }
 
 fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
@@ -611,6 +704,18 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
                         include_point(x, SVG_Y_FLIP - y);
                     }
                 }
+                DrawingObject::Text(text) => {
+                    let half_advance = text.content.chars().count() as f32 * TEXT_FONT_SIZE * 0.6;
+                    for (local_x, local_y) in [
+                        (-half_advance, TEXT_ORIGIN_Y_OFFSET),
+                        (half_advance, TEXT_ORIGIN_Y_OFFSET),
+                        (-half_advance, TEXT_ORIGIN_Y_OFFSET + TEXT_FONT_SIZE + 5.0),
+                        (half_advance, TEXT_ORIGIN_Y_OFFSET + TEXT_FONT_SIZE + 5.0),
+                    ] {
+                        let (x, y) = text.transform.apply_svg(local_x, local_y)?;
+                        include_point(x, y);
+                    }
+                }
             }
         }
     }
@@ -640,7 +745,7 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
         .flat_map(|layer| layer.objects.iter())
         .filter_map(|object| match object {
             DrawingObject::Image(image) => Some(image),
-            DrawingObject::Stroke(_) => None,
+            DrawingObject::Stroke(_) | DrawingObject::Text(_) => None,
         })
         .collect::<Vec<_>>();
     let has_filters = drawing.layers.iter().any(|layer| {
@@ -694,6 +799,7 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
             match object {
                 DrawingObject::Stroke(stroke) => write_stroke(&mut svg, stroke)?,
                 DrawingObject::Image(image) => write_image(&mut svg, image)?,
+                DrawingObject::Text(text) => write_text(&mut svg, text)?,
             }
         }
         writeln!(svg, "  </g>")?;
@@ -747,6 +853,48 @@ fn write_image(svg: &mut String, image: &EmbeddedImage) -> Result<()> {
     Ok(())
 }
 
+fn write_text(svg: &mut String, text: &Text) -> Result<()> {
+    use std::fmt::Write as _;
+
+    if !text.transform.is_affine() {
+        bail!("text has a projective transform that SVG text cannot represent");
+    }
+    let denominator = text.transform.m44;
+    let matrix = [
+        text.transform.m11 / denominator,
+        -text.transform.m12 / denominator,
+        -text.transform.m21 / denominator,
+        text.transform.m22 / denominator,
+        text.transform.m41 / denominator,
+        SVG_Y_FLIP - text.transform.m42 / denominator,
+    ]
+    .iter()
+    .map(|value| format_matrix_num(*value))
+    .collect::<Vec<_>>()
+    .join(" ");
+    let id = format!("TEXT_{}", text.id);
+    let opacity = format_num(text.opacity);
+    writeln!(
+        svg,
+        "    <g id=\"{id}\" opacity=\"{opacity}\" transform=\"matrix({matrix})\">"
+    )?;
+    writeln!(
+        svg,
+        "      <text x=\"0\" y=\"{}\" text-anchor=\"middle\" alignment-baseline=\"mathematical\" font-size=\"{}\" font-weight=\"lighter\" fill=\"{}\" font-family=\"'Helvetica Neue', Helvetica, Arial, sans-serif\">",
+        format_num(TEXT_ORIGIN_Y_OFFSET),
+        format_num(TEXT_FONT_SIZE),
+        xml_escape(&text.color)
+    )?;
+    writeln!(
+        svg,
+        "        <tspan x=\"0\" dy=\"1.000em\">{}</tspan>",
+        xml_escape(&text.content)
+    )?;
+    writeln!(svg, "      </text>")?;
+    writeln!(svg, "    </g>")?;
+    Ok(())
+}
+
 fn write_brush_filters(svg: &mut String, drawing: &Drawing) -> Result<()> {
     use std::fmt::Write as _;
 
@@ -756,7 +904,7 @@ fn write_brush_filters(svg: &mut String, drawing: &Drawing) -> Result<()> {
         .flat_map(|layer| layer.objects.iter())
         .filter_map(|object| match object {
             DrawingObject::Stroke(stroke) => stroke.filter,
-            DrawingObject::Image(_) => None,
+            DrawingObject::Image(_) | DrawingObject::Text(_) => None,
         })
         .collect::<HashSet<_>>();
     if filters.contains("FILTER_airbrush_24") {

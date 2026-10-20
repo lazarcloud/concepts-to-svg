@@ -11,6 +11,7 @@ const GEOMETRY_TOLERANCE: f64 = 1.0;
 // Concepts' mixed-brush export smooths some traces differently from the stored
 // point samples, so this fixture checks content and styles with a wider bound.
 const MIXED_BRUSH_GEOMETRY_TOLERANCE: f64 = 30.0;
+const TEXT_DRAWING_GEOMETRY_TOLERANCE: f64 = 35.0;
 const MIXED_BRUSH_VIEWBOX_TOLERANCE: f64 = 0.10;
 
 #[test]
@@ -47,17 +48,21 @@ fn generated_svgs_match_paired_exports_on_disk() {
         match kind {
             ConversionKind::Vector => {
                 vector_comparisons += 1;
-                let mixed_brush_fixture = archive
-                    .file_name()
-                    .is_some_and(|name| name == "Concepts 2 SVG Testfile 6.concepts");
+                let fixture_name = archive.file_name().and_then(|name| name.to_str());
+                let mixed_brush_fixture =
+                    fixture_name == Some("Concepts 2 SVG Testfile 6.concepts");
+                let text_fixture = fixture_name == Some("Concepts 2 SVG Testfile 7.concepts");
                 compare_background(&reference, &generated, archive);
                 compare_layers(&reference, &generated, archive);
+                compare_texts(&reference, &generated, archive);
                 compare_objects(
                     &reference,
                     &generated,
                     archive,
                     if mixed_brush_fixture {
                         MIXED_BRUSH_GEOMETRY_TOLERANCE
+                    } else if text_fixture {
+                        TEXT_DRAWING_GEOMETRY_TOLERANCE
                     } else {
                         GEOMETRY_TOLERANCE
                     },
@@ -68,7 +73,7 @@ fn generated_svgs_match_paired_exports_on_disk() {
                     &reference,
                     &generated,
                     archive,
-                    if mixed_brush_fixture {
+                    if mixed_brush_fixture || text_fixture {
                         MIXED_BRUSH_VIEWBOX_TOLERANCE
                     } else {
                         0.02
@@ -118,6 +123,83 @@ fn compare_filter_references(reference: &Document<'_>, generated: &Document<'_>,
             archive.display()
         );
     }
+}
+
+fn compare_texts(reference: &Document<'_>, generated: &Document<'_>, archive: &Path) {
+    let expected = text_group_map(reference);
+    let actual = text_group_map(generated);
+    assert_eq!(
+        expected.keys().collect::<Vec<_>>(),
+        actual.keys().collect::<Vec<_>>(),
+        "text object IDs differ for {}",
+        archive.display()
+    );
+
+    for (id, expected_group) in expected {
+        let actual_group = actual[&id];
+        let expected_text = expected_group
+            .descendants()
+            .find(|node| node.tag_name().name() == "text")
+            .unwrap();
+        let actual_text = actual_group
+            .descendants()
+            .find(|node| node.tag_name().name() == "text")
+            .unwrap();
+        let content = |node: Node<'_, '_>| {
+            node.descendants()
+                .filter(|child| child.tag_name().name() == "tspan")
+                .filter_map(|child| child.text())
+                .collect::<String>()
+        };
+        assert_eq!(
+            content(expected_text),
+            content(actual_text),
+            "text content for {id}"
+        );
+        for attribute in [
+            "font-size",
+            "font-weight",
+            "fill",
+            "font-family",
+            "alignment-baseline",
+        ] {
+            assert_eq!(
+                expected_text.attribute(attribute),
+                actual_text.attribute(attribute),
+                "text {attribute} for {id}"
+            );
+        }
+
+        let expected_matrix = parse_matrix(expected_group.attribute("transform").unwrap());
+        let actual_matrix = parse_matrix(actual_group.attribute("transform").unwrap());
+        assert_eq!(expected_matrix.len(), 6);
+        assert_eq!(actual_matrix.len(), 6);
+        for index in 0..4 {
+            assert!(
+                (expected_matrix[index] - actual_matrix[index]).abs() <= 0.000_01,
+                "text transform linear component {index} differs for {id}"
+            );
+        }
+        assert_eq!(actual_text.attribute("text-anchor"), Some("middle"));
+    }
+}
+
+fn text_group_map<'a, 'input>(
+    document: &'a Document<'input>,
+) -> BTreeMap<String, Node<'a, 'input>> {
+    document
+        .descendants()
+        .filter(|node| {
+            node.tag_name().name() == "g"
+                && node
+                    .attribute("id")
+                    .is_some_and(|id| id.starts_with("TEXT_"))
+                && node
+                    .descendants()
+                    .any(|child| child.tag_name().name() == "text")
+        })
+        .map(|group| (group.attribute("id").unwrap_or_default().to_owned(), group))
+        .collect()
 }
 
 fn compare_images(reference: &Document<'_>, generated: &Document<'_>, archive: &Path) {
