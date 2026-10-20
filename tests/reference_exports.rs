@@ -42,6 +42,7 @@ fn generated_svgs_match_paired_exports_on_disk() {
                 compare_background(&reference, &generated, archive);
                 compare_layers(&reference, &generated, archive);
                 compare_objects(&reference, &generated, archive);
+                compare_images(&reference, &generated, archive);
                 compare_viewbox_aspect_ratio(&reference, &generated, archive);
             }
             ConversionKind::ThumbnailFallback => {
@@ -55,6 +56,107 @@ fn generated_svgs_match_paired_exports_on_disk() {
 
     assert_eq!(vector_comparisons, archives.len());
     eprintln!("compared {vector_comparisons} vector export(s) against on-disk references");
+}
+
+fn compare_images(reference: &Document<'_>, generated: &Document<'_>, archive: &Path) {
+    let image_definitions = |document: &Document<'_>| {
+        document
+            .descendants()
+            .filter(|node| {
+                node.tag_name().name() == "image"
+                    && node
+                        .attribute("id")
+                        .is_some_and(|id| id.starts_with("IMAGE_DEF_"))
+            })
+            .map(|node| {
+                (
+                    node.attribute("id").unwrap_or_default().to_owned(),
+                    (
+                        node.attribute("width").unwrap_or_default().to_owned(),
+                        node.attribute("height").unwrap_or_default().to_owned(),
+                        node.attributes()
+                            .find(|attribute| attribute.name() == "href")
+                            .map(|attribute| attribute.value())
+                            .unwrap_or_default()
+                            .to_owned(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        image_definitions(reference),
+        image_definitions(generated),
+        "embedded image resources differ for {}",
+        archive.display()
+    );
+
+    let image_objects = |document: &Document<'_>| {
+        document
+            .descendants()
+            .filter(|node| {
+                node.tag_name().name() == "g"
+                    && node
+                        .attribute("id")
+                        .is_some_and(|id| id.starts_with("IMAGE_") && !id.starts_with("IMAGE_DEF_"))
+            })
+            .map(|node| {
+                let reference = node
+                    .descendants()
+                    .find(|child| child.tag_name().name() == "use")
+                    .and_then(|child| {
+                        child
+                            .attributes()
+                            .find(|attribute| attribute.name() == "href")
+                    })
+                    .map(|attribute| attribute.value().to_owned())
+                    .unwrap_or_default();
+                (
+                    node.attribute("id").unwrap_or_default().to_owned(),
+                    (
+                        node.attribute("opacity").unwrap_or_default().to_owned(),
+                        node.attribute("transform").unwrap_or_default().to_owned(),
+                        reference,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let expected = image_objects(reference);
+    let actual = image_objects(generated);
+    assert_eq!(
+        expected.keys().collect::<Vec<_>>(),
+        actual.keys().collect::<Vec<_>>(),
+        "embedded image object IDs differ for {}",
+        archive.display()
+    );
+    for (id, (expected_opacity, expected_transform, expected_href)) in &expected {
+        let (actual_opacity, actual_transform, actual_href) = &actual[id];
+        assert_eq!(expected_opacity, actual_opacity, "image opacity for {id}");
+        assert_eq!(
+            expected_href, actual_href,
+            "image resource reference for {id}"
+        );
+        let expected_matrix = parse_matrix(expected_transform);
+        let actual_matrix = parse_matrix(actual_transform);
+        assert_eq!(expected_matrix.len(), actual_matrix.len());
+        for (expected, actual) in expected_matrix.iter().zip(actual_matrix) {
+            assert!(
+                (expected - actual).abs() <= 0.000_01,
+                "image transform mismatch for {id}: expected {expected}, got {actual}"
+            );
+        }
+    }
+}
+
+fn parse_matrix(value: &str) -> Vec<f64> {
+    value
+        .strip_prefix("matrix(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("expected SVG matrix transform, got {value:?}"))
+        .split_whitespace()
+        .map(|number| number.parse().unwrap())
+        .collect()
 }
 
 fn compare_background<'a, 'input>(

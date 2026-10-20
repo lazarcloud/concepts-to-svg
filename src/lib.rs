@@ -1,4 +1,4 @@
-use std::{fs::File, io::Read, path::Path};
+use std::{collections::HashSet, fs::File, io::Read, path::Path};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -43,22 +43,56 @@ struct Stroke {
     points: Vec<Point>,
 }
 
+#[derive(Debug)]
+struct EmbeddedImage {
+    id: String,
+    resource_id: String,
+    bytes: Vec<u8>,
+    media_type: &'static str,
+    pixel_width: u32,
+    pixel_height: u32,
+    display_width: f32,
+    display_height: f32,
+    transform: PlanarTransform,
+}
+
+#[derive(Debug)]
+enum DrawingObject {
+    Stroke(Stroke),
+    Image(EmbeddedImage),
+}
+
 #[derive(Debug, Clone, Copy)]
-struct AffineTransform {
+struct PlanarTransform {
     m11: f32,
     m12: f32,
     m21: f32,
     m22: f32,
     m41: f32,
     m42: f32,
+    m14: f32,
+    m24: f32,
+    m44: f32,
 }
 
-impl AffineTransform {
-    fn apply(self, x: f32, y: f32) -> (f32, f32) {
-        (
-            x * self.m11 + y * self.m21 + self.m41,
-            x * self.m12 + y * self.m22 + self.m42,
-        )
+impl PlanarTransform {
+    fn apply(self, x: f32, y: f32) -> Result<(f32, f32)> {
+        let denominator = x * self.m14 + y * self.m24 + self.m44;
+        if !denominator.is_finite() || denominator.abs() <= f32::EPSILON {
+            bail!("transform maps a point to infinity");
+        }
+        let transformed = (
+            (x * self.m11 + y * self.m21 + self.m41) / denominator,
+            (x * self.m12 + y * self.m22 + self.m42) / denominator,
+        );
+        if !transformed.0.is_finite() || !transformed.1.is_finite() {
+            bail!("transform produces a non-finite point");
+        }
+        Ok(transformed)
+    }
+
+    fn is_affine(self) -> bool {
+        self.m14.abs() <= 1e-6 && self.m24.abs() <= 1e-6 && self.m44.abs() > f32::EPSILON
     }
 }
 
@@ -67,7 +101,7 @@ struct Layer {
     name: String,
     visible: bool,
     opacity: f32,
-    strokes: Vec<Stroke>,
+    objects: Vec<DrawingObject>,
 }
 
 #[derive(Debug)]
@@ -169,10 +203,33 @@ fn parse_vector_archive(archive: &mut ZipArchive<File>) -> Result<Drawing> {
         rmpv::decode::read_value(&mut std::io::Cursor::new(bytes))
             .context("decoding tree.pack MessagePack")?
     };
-    parse_tree(&tree, background)
+    parse_tree(&tree, background, |path| read_resource(archive, path))
 }
 
-fn parse_tree(tree: &rmpv::Value, background: String) -> Result<Drawing> {
+fn read_resource(archive: &mut ZipArchive<File>, path: &str) -> Result<Vec<u8>> {
+    const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+    let mut resource = archive
+        .by_name(path)
+        .with_context(|| format!("reading embedded image resource {path}"))?;
+    if resource.size() > MAX_IMAGE_BYTES {
+        bail!("embedded image {path} is larger than the 64 MiB safety limit");
+    }
+    let mut bytes = Vec::with_capacity(resource.size() as usize);
+    resource
+        .by_ref()
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading embedded image resource {path}"))?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        bail!("embedded image {path} is larger than the 64 MiB safety limit");
+    }
+    Ok(bytes)
+}
+
+fn parse_tree<F>(tree: &rmpv::Value, background: String, mut read_resource: F) -> Result<Drawing>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
     let root = array(tree, "tree root")?;
     let document = array(required(root, 1, "tree document")?, "tree document")?;
     let layer_values = array(required(document, 4, "document layers")?, "document layers")?;
@@ -181,17 +238,7 @@ fn parse_tree(tree: &rmpv::Value, background: String) -> Result<Drawing> {
     for (index, value) in layer_values.iter().enumerate() {
         let fields = array(value, "layer")?;
         let layer_metadata = array(required(fields, 1, "layer metadata")?, "layer metadata")?;
-        let name = fields
-            .get(3)
-            .and_then(rmpv::Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                if index == 0 {
-                    "Pen".to_owned()
-                } else {
-                    format!("Layer {}", index + 1)
-                }
-            });
+        let name = layer_name(fields.get(3), index);
         let visible = layer_metadata
             .get(6)
             .and_then(rmpv::Value::as_bool)
@@ -202,11 +249,11 @@ fn parse_tree(tree: &rmpv::Value, background: String) -> Result<Drawing> {
             .transpose()?
             .unwrap_or(1.0)
             .clamp(0.0, 1.0);
-        let strokes = if visible && opacity > 0.0 {
+        let objects = if visible && opacity > 0.0 {
             let object_values = array(required(fields, 2, "layer objects")?, "layer objects")?;
             object_values
                 .iter()
-                .map(parse_stroke)
+                .map(|object| parse_object(object, &mut read_resource))
                 .collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
@@ -215,22 +262,40 @@ fn parse_tree(tree: &rmpv::Value, background: String) -> Result<Drawing> {
             name,
             visible,
             opacity,
-            strokes,
+            objects,
         });
     }
 
-    if layers.iter().all(|layer| layer.strokes.is_empty()) {
-        bail!("tree.pack contains no supported strokes");
-    }
     Ok(Drawing { background, layers })
+}
+
+fn layer_name(value: Option<&rmpv::Value>, index: usize) -> String {
+    if let Some(name) = value.and_then(rmpv::Value::as_str) {
+        return name.to_owned();
+    }
+    match value.and_then(rmpv::Value::as_i64) {
+        Some(0) => "Image".to_owned(),
+        Some(9) => "Pen".to_owned(),
+        _ if index == 0 => "Pen".to_owned(),
+        _ => format!("Layer {}", index + 1),
+    }
+}
+
+fn parse_object<F>(object: &rmpv::Value, read_resource: &mut F) -> Result<DrawingObject>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
+    let object_fields = array(object, "drawing object")?;
+    let object_type = integer(required(object_fields, 0, "drawing object type")?)?;
+    match object_type {
+        10 | 11 => parse_stroke(object).map(DrawingObject::Stroke),
+        7 => parse_image(object, read_resource).map(DrawingObject::Image),
+        _ => bail!("unsupported drawing object type {object_type}"),
+    }
 }
 
 fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
     let object_fields = array(object, "drawing object")?;
-    let object_type = integer(required(object_fields, 0, "drawing object type")?)?;
-    if !matches!(object_type, 10 | 11) {
-        bail!("unsupported drawing object type");
-    }
     let object_body = array(
         required(object_fields, 1, "drawing object body")?,
         "drawing object body",
@@ -301,7 +366,9 @@ fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
     for record in point_bytes.chunks_exact(POINT_RECORD_SIZE) {
         let source_x = f32::from_le_bytes(record[0..4].try_into().expect("four-byte x"));
         let source_y = f32::from_le_bytes(record[4..8].try_into().expect("four-byte y"));
-        let (x, transformed_y) = transform.apply(source_x, source_y);
+        let (x, transformed_y) = transform
+            .apply(source_x, source_y)
+            .context("transforming stroke point")?;
         let y = SVG_Y_FLIP - transformed_y;
         if !x.is_finite() || !y.is_finite() {
             bail!("stroke point contains a non-finite coordinate");
@@ -325,7 +392,131 @@ fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
     })
 }
 
-fn parse_transform(bytes: &[u8]) -> Result<AffineTransform> {
+fn parse_image<F>(object: &rmpv::Value, read_resource: &mut F) -> Result<EmbeddedImage>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
+    let object_fields = array(object, "image object")?;
+    let body = array(
+        required(object_fields, 1, "image object body")?,
+        "image object body",
+    )?;
+    let metadata = array(required(body, 1, "image metadata")?, "image metadata")?;
+    if integer(required(metadata, 0, "image metadata type")?)? != 3 {
+        bail!("unsupported image metadata type");
+    }
+    let id_bytes = extension(
+        required(metadata, 2, "image object UUID")?,
+        5,
+        "image object UUID",
+    )?;
+    if id_bytes.len() != 16 {
+        bail!("image object UUID has invalid length {}", id_bytes.len());
+    }
+    let id = format_uuid(id_bytes);
+
+    let resource_bytes = extension(
+        required(body, 2, "image resource UUID")?,
+        5,
+        "image resource UUID",
+    )?;
+    if resource_bytes.len() != 16 {
+        bail!(
+            "image resource UUID has invalid length {}",
+            resource_bytes.len()
+        );
+    }
+    let resource_id = format_uuid(resource_bytes);
+    let mut embedded_resource = None;
+    let mut resource_error = None;
+    for extension in ["png", "jpg", "jpeg"] {
+        let image_path = format!("resources/{resource_id}.{extension}");
+        match read_resource(&image_path) {
+            Ok(bytes) => {
+                embedded_resource = Some(bytes);
+                break;
+            }
+            Err(error) => resource_error = Some(error),
+        }
+    }
+    let bytes = match embedded_resource {
+        Some(bytes) => bytes,
+        None => {
+            return Err(resource_error
+                .unwrap_or_else(|| anyhow::anyhow!("image resource {resource_id} was not found")))
+            .with_context(|| format!("reading embedded image resource {resource_id}"));
+        }
+    };
+    let (pixel_width, pixel_height, media_type) = raster_image_info(&bytes)?;
+
+    let display_size = extension(
+        required(body, 3, "image display size")?,
+        1,
+        "image display size",
+    )?;
+    if display_size.len() != 8 {
+        bail!(
+            "image display size has invalid length {}",
+            display_size.len()
+        );
+    }
+    let display_width = f32::from_le_bytes(display_size[0..4].try_into().expect("four-byte width"));
+    let display_height =
+        f32::from_le_bytes(display_size[4..8].try_into().expect("four-byte height"));
+    if !display_width.is_finite()
+        || !display_height.is_finite()
+        || display_width <= 0.0
+        || display_height <= 0.0
+    {
+        bail!("image has invalid display size {display_width}x{display_height}");
+    }
+
+    let transform = parse_transform(extension(
+        required(body, 5, "image transform")?,
+        7,
+        "image transform",
+    )?)?;
+    if !transform.is_affine() {
+        bail!("embedded image has a projective transform that SVG cannot represent");
+    }
+    Ok(EmbeddedImage {
+        id,
+        resource_id,
+        bytes,
+        media_type,
+        pixel_width,
+        pixel_height,
+        display_width,
+        display_height,
+        transform,
+    })
+}
+
+fn png_dimensions(png: &[u8]) -> Result<(u32, u32)> {
+    if !png.starts_with(b"\x89PNG\r\n\x1a\n") || png.len() < 24 || &png[12..16] != b"IHDR" {
+        bail!("embedded image is not a supported PNG");
+    }
+    let width = u32::from_be_bytes(png[16..20].try_into().expect("four-byte PNG width"));
+    let height = u32::from_be_bytes(png[20..24].try_into().expect("four-byte PNG height"));
+    if width == 0 || height == 0 {
+        bail!("PNG image has invalid dimensions {width}x{height}");
+    }
+    Ok((width, height))
+}
+
+fn raster_image_info(bytes: &[u8]) -> Result<(u32, u32, &'static str)> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let (width, height) = png_dimensions(bytes)?;
+        Ok((width, height, "image/png"))
+    } else if bytes.starts_with(&[0xff, 0xd8]) {
+        let (width, height) = jpeg_dimensions(bytes)?;
+        Ok((width, height, "image/jpeg"))
+    } else {
+        bail!("embedded image is neither PNG nor JPEG")
+    }
+}
+
+fn parse_transform(bytes: &[u8]) -> Result<PlanarTransform> {
     if bytes.len() != 16 * 4 {
         bail!("stroke transform has invalid length {}", bytes.len());
     }
@@ -336,57 +527,64 @@ fn parse_transform(bytes: &[u8]) -> Result<AffineTransform> {
     if values.iter().any(|value| !value.is_finite()) {
         bail!("stroke transform contains a non-finite value");
     }
-    // Stored as a System.Numerics row-vector 4x4 affine transform.
-    for (index, expected) in [
-        (2, 0.0),
-        (3, 0.0),
-        (6, 0.0),
-        (7, 0.0),
-        (8, 0.0),
-        (9, 0.0),
-        (10, 1.0),
-        (11, 0.0),
-        (14, 0.0),
-        (15, 1.0),
-    ] {
-        if (values[index] - expected).abs() > 1e-6 {
-            bail!("stroke transform is not a 2D affine matrix");
-        }
-    }
-    Ok(AffineTransform {
+    // Points have z=0, so their planar transform is the corresponding 3x3
+    // homography in the x/y/w components of the stored row-vector matrix.
+    Ok(PlanarTransform {
         m11: values[0],
         m12: values[1],
         m21: values[4],
         m22: values[5],
         m41: values[12],
         m42: values[13],
+        m14: values[3],
+        m24: values[7],
+        m44: values[15],
     })
 }
 
 fn vector_svg(drawing: &Drawing) -> Result<String> {
     let mut bounds: Option<(f32, f32, f32, f32)> = None;
     let mut max_width: f32 = 0.0;
+
+    let mut include_point = |x: f32, y: f32| {
+        bounds = Some(match bounds {
+            None => (x, y, x, y),
+            Some((min_x, min_y, max_x, max_y)) => {
+                (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+            }
+        });
+    };
     for layer in &drawing.layers {
         if !layer.visible || layer.opacity <= 0.0 {
             continue;
         }
-        for stroke in &layer.strokes {
-            max_width = max_width.max(stroke.width);
-            for point in &stroke.points {
-                bounds = Some(match bounds {
-                    None => (point.x, point.y, point.x, point.y),
-                    Some((min_x, min_y, max_x, max_y)) => (
-                        min_x.min(point.x),
-                        min_y.min(point.y),
-                        max_x.max(point.x),
-                        max_y.max(point.y),
-                    ),
-                });
+        for object in &layer.objects {
+            match object {
+                DrawingObject::Stroke(stroke) => {
+                    max_width = max_width.max(stroke.width);
+                    for point in &stroke.points {
+                        include_point(point.x, point.y);
+                    }
+                }
+                DrawingObject::Image(image) => {
+                    let half_width = image.display_width / 2.0;
+                    let half_height = image.display_height / 2.0;
+                    for (local_x, local_y) in [
+                        (-half_width, half_height),
+                        (half_width, half_height),
+                        (half_width, -half_height),
+                        (-half_width, -half_height),
+                    ] {
+                        let (x, y) = image.transform.apply(local_x, local_y)?;
+                        include_point(x, SVG_Y_FLIP - y);
+                    }
+                }
             }
         }
     }
-    let (min_x, min_y, max_x, max_y) = bounds.context("drawing has no visible points")?;
-    let padding = max_width / 2.0 + 4.0;
+    let empty = bounds.is_none();
+    let (min_x, min_y, max_x, max_y) = bounds.unwrap_or((0.0, -256.0, 1024.0, 768.0));
+    let padding = if empty { 0.0 } else { max_width / 2.0 + 4.0 };
     let x = min_x - padding;
     let y = min_y - padding;
     let width = (max_x - min_x + padding * 2.0).max(1.0);
@@ -404,6 +602,34 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
         format_num(width),
         format_num(height)
     )?;
+    let images = drawing
+        .layers
+        .iter()
+        .flat_map(|layer| layer.objects.iter())
+        .filter_map(|object| match object {
+            DrawingObject::Image(image) => Some(image),
+            DrawingObject::Stroke(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if !images.is_empty() {
+        writeln!(svg, "  <defs>")?;
+        let mut defined_resources = HashSet::new();
+        for image in &images {
+            if !defined_resources.insert(image.resource_id.as_str()) {
+                continue;
+            }
+            writeln!(
+                svg,
+                "    <image id=\"IMAGE_DEF_{}\" width=\"{}\" height=\"{}\" href=\"data:{};base64,{}\" />",
+                image.resource_id,
+                image.pixel_width,
+                image.pixel_height,
+                image.media_type,
+                STANDARD.encode(&image.bytes)
+            )?;
+        }
+        writeln!(svg, "  </defs>")?;
+    }
     writeln!(
         svg,
         "  <rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" stroke=\"none\" fill=\"{}\" />",
@@ -415,7 +641,7 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
     )?;
 
     for (layer_index, layer) in drawing.layers.iter().enumerate() {
-        if !layer.visible || layer.opacity <= 0.0 {
+        if !layer.visible || layer.opacity <= 0.0 || layer.objects.is_empty() {
             continue;
         }
         let id = xml_escape(&layer_id(&layer.name, layer_index));
@@ -424,13 +650,61 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
             "  <g id=\"{id}\" opacity=\"{}\">",
             format_num(layer.opacity)
         )?;
-        for stroke in &layer.strokes {
-            write_stroke(&mut svg, stroke)?;
+        for object in &layer.objects {
+            match object {
+                DrawingObject::Stroke(stroke) => write_stroke(&mut svg, stroke)?,
+                DrawingObject::Image(image) => write_image(&mut svg, image)?,
+            }
         }
         writeln!(svg, "  </g>")?;
     }
     writeln!(svg, "</svg>")?;
     Ok(svg)
+}
+
+fn write_image(svg: &mut String, image: &EmbeddedImage) -> Result<()> {
+    use std::fmt::Write as _;
+
+    if !image.transform.is_affine() {
+        bail!("embedded image has a projective transform that SVG cannot represent");
+    }
+    let denominator = image.transform.m44;
+    let m11 = image.transform.m11 / denominator;
+    let m12 = image.transform.m12 / denominator;
+    let m21 = image.transform.m21 / denominator;
+    let m22 = image.transform.m22 / denominator;
+    let tx = image.transform.m41 / denominator;
+    let ty = image.transform.m42 / denominator;
+    let scale_x = image.display_width / image.pixel_width as f32;
+    let scale_y = image.display_height / image.pixel_height as f32;
+    let matrix = [
+        m11 * scale_x,
+        -m12 * scale_x,
+        -m21 * scale_y,
+        m22 * scale_y,
+        tx - image.display_width / 2.0 * m11 + image.display_height / 2.0 * m21,
+        SVG_Y_FLIP - ty + image.display_width / 2.0 * m12 - image.display_height / 2.0 * m22,
+    ];
+    if matrix.iter().any(|value| !value.is_finite()) {
+        bail!("embedded image produces a non-finite SVG transform");
+    }
+    let id = format!("IMAGE_{}", image.id);
+    let matrix = matrix
+        .iter()
+        .map(|value| format_matrix_num(*value))
+        .collect::<Vec<_>>()
+        .join(" ");
+    writeln!(
+        svg,
+        "    <g id=\"{id}\" opacity=\"1.000\" transform=\"matrix({matrix})\">"
+    )?;
+    writeln!(
+        svg,
+        "      <use href=\"#IMAGE_DEF_{}\" width=\"{}\" height=\"{}\" />",
+        image.resource_id, image.pixel_width, image.pixel_height
+    )?;
+    writeln!(svg, "    </g>")?;
+    Ok(())
 }
 
 fn write_stroke(svg: &mut String, stroke: &Stroke) -> Result<()> {
@@ -571,6 +845,14 @@ fn format_num(value: f32) -> String {
     }
 }
 
+fn format_matrix_num(value: f32) -> String {
+    if value.abs() < 0.000_000_5 {
+        "0.000000".to_owned()
+    } else {
+        format!("{value:.6}")
+    }
+}
+
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -683,8 +965,8 @@ mod tests {
     use zip::{ZipWriter, write::SimpleFileOptions};
 
     use super::{
-        ConversionKind, SVG_Y_FLIP, convert_file, convert_file_with_policy, jpeg_dimensions,
-        parse_transform, parse_tree, thumbnail_svg, vector_svg,
+        ConversionKind, Drawing, Layer, SVG_Y_FLIP, convert_file, convert_file_with_policy,
+        jpeg_dimensions, parse_transform, parse_tree, raster_image_info, thumbnail_svg, vector_svg,
     };
     use rmpv::Value;
 
@@ -889,6 +1171,14 @@ mod tests {
     }
 
     #[test]
+    fn detects_embedded_jpeg_media_type_and_dimensions() {
+        assert_eq!(
+            raster_image_info(&minimal_jpeg(288, 407)).unwrap(),
+            (288, 407, "image/jpeg")
+        );
+    }
+
+    #[test]
     fn svg_embeds_thumbnail_without_reencoding_it() {
         let jpeg = minimal_jpeg(320, 200);
         let svg = thumbnail_svg(&jpeg, 320, 200);
@@ -906,7 +1196,8 @@ mod tests {
 
     #[test]
     fn decodes_stroke_points_color_and_canvas_y_axis() {
-        let drawing = parse_tree(&synthetic_tree(), "#000000".to_owned()).unwrap();
+        let drawing =
+            parse_tree(&synthetic_tree(), "#000000".to_owned(), |_| Ok(Vec::new())).unwrap();
         let svg = vector_svg(&drawing).unwrap();
         assert!(svg.contains("stroke=\"#ffcb12\""));
         assert!(svg.contains("stroke-width=\"3.000\""));
@@ -919,6 +1210,7 @@ mod tests {
         let drawing = parse_tree(
             &synthetic_tree_with_brush(6, 5.0, 0.694),
             "#000000".to_owned(),
+            |_| Ok(Vec::new()),
         )
         .unwrap();
         let svg = vector_svg(&drawing).unwrap();
@@ -951,9 +1243,43 @@ mod tests {
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
         let transform = parse_transform(&bytes).unwrap();
-        let (x, y) = transform.apply(66.481_05, -343.740_4);
+        let (x, y) = transform.apply(66.481_05, -343.740_4).unwrap();
         assert!((x - 58.549).abs() < 0.001);
         assert!((SVG_Y_FLIP - y - 1130.559).abs() < 0.001);
+    }
+
+    #[test]
+    fn applies_planar_projective_transform_with_perspective_divide() {
+        let values = [
+            1.0_f32, 0.0, 0.0, 0.1, 0.0, 1.0, 0.0, 0.2, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0,
+        ];
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let transform = parse_transform(&bytes).unwrap();
+        assert!(!transform.is_affine());
+        let (x, y) = transform.apply(3.0, 1.0).unwrap();
+        assert!((x - 1.2).abs() < 0.000_001);
+        assert!((y - 0.4).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn renders_empty_drawing_as_background_only_vector_svg() {
+        let drawing = Drawing {
+            background: "#000000".to_owned(),
+            layers: vec![Layer {
+                name: "Pen".to_owned(),
+                visible: true,
+                opacity: 1.0,
+                objects: Vec::new(),
+            }],
+        };
+        let svg = vector_svg(&drawing).unwrap();
+        assert!(svg.contains("viewBox=\"0.000 -256.000 1024.000 1024.000\""));
+        assert!(svg.contains("fill=\"#000000\""));
+        assert!(!svg.contains("<g "));
+        assert!(!svg.contains("<image "));
     }
 
     #[test]
