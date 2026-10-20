@@ -40,6 +40,11 @@ struct Stroke {
     width: f32,
     opacity: f32,
     closed: bool,
+    filled: bool,
+    line_cap: &'static str,
+    line_join: &'static str,
+    dasharray: Option<(f32, f32)>,
+    filter: Option<&'static str>,
     points: Vec<Point>,
 }
 
@@ -275,7 +280,13 @@ fn layer_name(value: Option<&rmpv::Value>, index: usize) -> String {
     }
     match value.and_then(rmpv::Value::as_i64) {
         Some(0) => "Image".to_owned(),
+        Some(1) => "Watercolor".to_owned(),
+        Some(3) => "Pencil".to_owned(),
+        Some(4) => "Fill".to_owned(),
+        Some(5) => "Marker".to_owned(),
+        Some(7) => "Airbrush".to_owned(),
         Some(9) => "Pen".to_owned(),
+        Some(10) => "Wire".to_owned(),
         _ if index == 0 => "Pen".to_owned(),
         _ => format!("Layer {}", index + 1),
     }
@@ -288,7 +299,7 @@ where
     let object_fields = array(object, "drawing object")?;
     let object_type = integer(required(object_fields, 0, "drawing object type")?)?;
     match object_type {
-        10 | 11 => parse_stroke(object).map(DrawingObject::Stroke),
+        3 | 4 | 5 | 6 | 9 | 10 | 11 | 15 | 4096 => parse_stroke(object).map(DrawingObject::Stroke),
         7 => parse_image(object, read_resource).map(DrawingObject::Image),
         _ => bail!("unsupported drawing object type {object_type}"),
     }
@@ -347,9 +358,20 @@ fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
         * channels[3].clamp(0.0, 1.0);
     let brush_variant = array(required(color_fields, 1, "brush variant")?, "brush variant")?;
     let brush_variant = integer(required(brush_variant, 1, "brush variant code")?)?;
-    let width = number(required(parameters, 3, "stroke width")?)?
-        / if brush_variant == 6 { 2.0 } else { 1.0 };
-    if !width.is_finite() || width <= 0.0 {
+    let filled = brush_variant == 11;
+    let width_value = required(parameters, 3, "stroke width")?;
+    let width = if filled && matches!(width_value, rmpv::Value::Nil) {
+        0.0
+    } else {
+        number(width_value)?
+            * match brush_variant {
+                5 => 0.63,
+                6 => 0.5,
+                12 => 0.85,
+                _ => 1.0,
+            }
+    };
+    if !width.is_finite() || width < 0.0 || (width == 0.0 && !filled) {
         bail!("stroke has invalid width {width}");
     }
 
@@ -388,6 +410,16 @@ fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
         width,
         opacity,
         closed,
+        filled,
+        line_cap: if brush_variant == 8 { "butt" } else { "round" },
+        line_join: if brush_variant == 8 { "bevel" } else { "round" },
+        dasharray: (brush_variant == 6).then_some((width * 0.1, width * 1.5)),
+        filter: match brush_variant {
+            5 | 12 => Some("FILTER_airbrush_24"),
+            8 => Some("FILTER_marker"),
+            14 | 15 => Some("FILTER_pencil"),
+            _ => None,
+        },
         points,
     })
 }
@@ -611,8 +643,16 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
             DrawingObject::Stroke(_) => None,
         })
         .collect::<Vec<_>>();
-    if !images.is_empty() {
+    let has_filters = drawing.layers.iter().any(|layer| {
+        layer.objects.iter().any(
+            |object| matches!(object, DrawingObject::Stroke(stroke) if stroke.filter.is_some()),
+        )
+    });
+    if !images.is_empty() || has_filters {
         writeln!(svg, "  <defs>")?;
+        if has_filters {
+            write_brush_filters(&mut svg, drawing)?;
+        }
         let mut defined_resources = HashSet::new();
         for image in &images {
             if !defined_resources.insert(image.resource_id.as_str()) {
@@ -707,6 +747,41 @@ fn write_image(svg: &mut String, image: &EmbeddedImage) -> Result<()> {
     Ok(())
 }
 
+fn write_brush_filters(svg: &mut String, drawing: &Drawing) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let filters = drawing
+        .layers
+        .iter()
+        .flat_map(|layer| layer.objects.iter())
+        .filter_map(|object| match object {
+            DrawingObject::Stroke(stroke) => stroke.filter,
+            DrawingObject::Image(_) => None,
+        })
+        .collect::<HashSet<_>>();
+    if filters.contains("FILTER_airbrush_24") {
+        writeln!(
+            svg,
+            "    <filter id=\"FILTER_airbrush_24\" filterUnits=\"userSpaceOnUse\"><feGaussianBlur in=\"SourceGraphic\" stdDeviation=\"8\" /></filter>"
+        )?;
+    }
+    if filters.contains("FILTER_pencil") {
+        // Concepts exports a raster texture for pencil. Keep the SVG vector-only
+        // and preserve a filter hook while approximating that texture as smooth ink.
+        writeln!(
+            svg,
+            "    <filter id=\"FILTER_pencil\" filterUnits=\"objectBoundingBox\" x=\"-8\" y=\"-8\" width=\"16\" height=\"16\" />"
+        )?;
+    }
+    if filters.contains("FILTER_marker") {
+        writeln!(
+            svg,
+            "    <filter id=\"FILTER_marker\" x=\"-5\" y=\"-5\" width=\"10\" height=\"10\"><feTurbulence baseFrequency=\"10\" type=\"fractalNoise\" seed=\"1\" numOctaves=\"7\" result=\"turbulence\" /><feColorMatrix type=\"luminanceToAlpha\" result=\"alpha\" in=\"turbulence\" /><feComposite operator=\"atop\" in=\"alpha\" in2=\"SourceGraphic\" /></filter>"
+        )?;
+    }
+    Ok(())
+}
+
 fn write_stroke(svg: &mut String, stroke: &Stroke) -> Result<()> {
     use std::fmt::Write as _;
     let opacity = format_num(stroke.opacity);
@@ -730,9 +805,31 @@ fn write_stroke(svg: &mut String, stroke: &Stroke) -> Result<()> {
 
     write!(
         svg,
-        "    <path id=\"{id}\" opacity=\"{opacity}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" stroke-opacity=\"{opacity}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M {} {}",
+        "    <path id=\"{id}\" opacity=\"{opacity}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"{}\" stroke-opacity=\"{opacity}\" stroke-linecap=\"{}\" stroke-linejoin=\"{}\"",
+        if stroke.filled {
+            stroke.color.as_str()
+        } else {
+            "none"
+        },
         stroke.color,
         format_num(stroke.width),
+        stroke.line_cap,
+        stroke.line_join
+    )?;
+    if let Some((dash, gap)) = stroke.dasharray {
+        write!(
+            svg,
+            " stroke-dasharray=\"{},{}\"",
+            format_num(dash),
+            format_num(gap)
+        )?;
+    }
+    if let Some(filter) = stroke.filter {
+        write!(svg, " filter=\"url(#{filter})\"")?;
+    }
+    write!(
+        svg,
+        " d=\"M {} {}",
         format_num(stroke.points[0].x),
         format_num(stroke.points[0].y)
     )?;
