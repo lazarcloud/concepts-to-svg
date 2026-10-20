@@ -79,6 +79,15 @@ struct Drawing {
 /// Converts a Concepts archive to SVG, falling back to its embedded thumbnail
 /// if the vector records contain unsupported content.
 pub fn convert_file(input: &Path, output: &Path) -> Result<ConversionKind> {
+    convert_file_with_policy(input, output, false)
+}
+
+/// Converts an archive and optionally rejects thumbnail fallback output.
+pub fn convert_file_with_policy(
+    input: &Path,
+    output: &Path,
+    require_vector: bool,
+) -> Result<ConversionKind> {
     let file = File::open(input).with_context(|| format!("opening {}", input.display()))?;
     let mut archive = ZipArchive::new(file).context("reading .concepts ZIP archive")?;
     let jpeg = read_thumbnail(&mut archive)?;
@@ -103,6 +112,13 @@ pub fn convert_file(input: &Path, output: &Path) -> Result<ConversionKind> {
             )
         }
     };
+
+    if require_vector && kind != ConversionKind::Vector {
+        bail!(
+            "{} requires vector conversion, but only thumbnail fallback was available",
+            input.display()
+        );
+    }
 
     std::fs::write(output, svg).with_context(|| format!("writing {}", output.display()))?;
     Ok(kind)
@@ -667,8 +683,8 @@ mod tests {
     use zip::{ZipWriter, write::SimpleFileOptions};
 
     use super::{
-        ConversionKind, SVG_Y_FLIP, convert_file, jpeg_dimensions, parse_transform, parse_tree,
-        thumbnail_svg, vector_svg,
+        ConversionKind, SVG_Y_FLIP, convert_file, convert_file_with_policy, jpeg_dimensions,
+        parse_transform, parse_tree, thumbnail_svg, vector_svg,
     };
     use rmpv::Value;
 
@@ -954,6 +970,17 @@ mod tests {
         let svg = std::fs::read_to_string(output).unwrap();
         assert!(svg.contains("viewBox=\"0 0 1024 593\""));
         assert!(svg.contains("data:image/jpeg;base64,"));
+    }
+
+    #[test]
+    fn strict_conversion_rejects_fallback_without_writing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("drawing.concepts");
+        let output = dir.path().join("drawing.svg");
+        std::fs::write(&input, archive_with_thumbnail(&minimal_jpeg(100, 80))).unwrap();
+
+        assert!(convert_file_with_policy(&input, &output, true).is_err());
+        assert!(!output.exists());
     }
 
     #[test]

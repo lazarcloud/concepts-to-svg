@@ -12,6 +12,10 @@ struct Args {
     /// Output SVG path (defaults to the input path with a .svg extension)
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Fail instead of embedding the thumbnail when vector conversion is unsupported
+    #[arg(long)]
+    require_vector: bool,
 }
 
 fn main() -> Result<()> {
@@ -31,7 +35,7 @@ fn main() -> Result<()> {
         );
     }
 
-    let kind = concepts_to_svg::convert_file(&args.input, &output)
+    let kind = concepts_to_svg::convert_file_with_policy(&args.input, &output, args.require_vector)
         .with_context(|| format!("converting {}", args.input.display()))?;
     println!("Wrote {} ({kind})", output.display());
     Ok(())
