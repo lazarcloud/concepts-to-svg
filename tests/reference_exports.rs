@@ -8,7 +8,8 @@ const GEOMETRY_TOLERANCE: f64 = 1.0;
 #[test]
 fn generated_svgs_match_paired_exports_on_disk() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut archives = fs::read_dir(root)
+    let fixture_dir = root.join("tests/fixtures");
+    let mut archives = fs::read_dir(&fixture_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "concepts"))
@@ -17,10 +18,10 @@ fn generated_svgs_match_paired_exports_on_disk() {
     archives.sort();
 
     if archives.is_empty() {
-        eprintln!(
-            "skipping reference SVG comparisons: no paired .concepts/.svg files in the project root"
+        panic!(
+            "no paired .concepts/.svg references found in {}",
+            fixture_dir.display()
         );
-        return;
     }
 
     let output_dir = tempfile::tempdir().unwrap();
@@ -52,10 +53,7 @@ fn generated_svgs_match_paired_exports_on_disk() {
         }
     }
 
-    assert!(
-        vector_comparisons > 0,
-        "paired reference files were found, but none exercised vector conversion"
-    );
+    assert_eq!(vector_comparisons, archives.len());
     eprintln!("compared {vector_comparisons} vector export(s) against on-disk references");
 }
 
