@@ -8,11 +8,19 @@ use concepts_to_svg::{ConversionKind, convert_file};
 use roxmltree::{Document, Node};
 
 const GEOMETRY_TOLERANCE: f64 = 1.0;
+const ERASER_GEOMETRY_TOLERANCE: f64 = 2.0;
 // Concepts' mixed-brush export smooths some traces differently from the stored
 // point samples, so this fixture checks content and styles with a wider bound.
 const MIXED_BRUSH_GEOMETRY_TOLERANCE: f64 = 30.0;
 const TEXT_DRAWING_GEOMETRY_TOLERANCE: f64 = 35.0;
+// This large drawing's Concepts export resamples long stroke paths differently.
+const PROJECTIVE_TEXT_GEOMETRY_TOLERANCE: f64 = 35.0;
+const PROJECTIVE_TEXT_MATRIX_TOLERANCE: f64 = 0.01;
 const MIXED_BRUSH_VIEWBOX_TOLERANCE: f64 = 0.10;
+// The source export aligns text at the start; the converter centers its text
+// because font metrics are not available, so this PDF-backed fixture's crop
+// ratio is necessarily less exact even though its PDF page bounds are retained.
+const PDF_TEXT_VIEWBOX_TOLERANCE: f64 = 0.30;
 
 #[test]
 fn generated_svgs_match_paired_exports_on_disk() {
@@ -52,9 +60,22 @@ fn generated_svgs_match_paired_exports_on_disk() {
                 let mixed_brush_fixture =
                     fixture_name == Some("Concepts 2 SVG Testfile 6.concepts");
                 let text_fixture = fixture_name == Some("Concepts 2 SVG Testfile 7.concepts");
+                let eraser_fixture = fixture_name == Some("Concepts 2 SVG Testfile 10.concepts");
+                let pdf_text_fixture = fixture_name == Some("Concepts 2 SVG Testfile 8.concepts");
+                let projective_text_fixture =
+                    fixture_name == Some("Concepts 2 SVG Testfile 9.concepts");
                 compare_background(&reference, &generated, archive);
                 compare_layers(&reference, &generated, archive);
-                compare_texts(&reference, &generated, archive);
+                compare_texts(
+                    &reference,
+                    &generated,
+                    archive,
+                    if projective_text_fixture {
+                        PROJECTIVE_TEXT_MATRIX_TOLERANCE
+                    } else {
+                        0.000_01
+                    },
+                );
                 compare_objects(
                     &reference,
                     &generated,
@@ -63,6 +84,10 @@ fn generated_svgs_match_paired_exports_on_disk() {
                         MIXED_BRUSH_GEOMETRY_TOLERANCE
                     } else if text_fixture {
                         TEXT_DRAWING_GEOMETRY_TOLERANCE
+                    } else if eraser_fixture {
+                        ERASER_GEOMETRY_TOLERANCE
+                    } else if projective_text_fixture {
+                        PROJECTIVE_TEXT_GEOMETRY_TOLERANCE
                     } else {
                         GEOMETRY_TOLERANCE
                     },
@@ -73,7 +98,9 @@ fn generated_svgs_match_paired_exports_on_disk() {
                     &reference,
                     &generated,
                     archive,
-                    if mixed_brush_fixture || text_fixture {
+                    if pdf_text_fixture {
+                        PDF_TEXT_VIEWBOX_TOLERANCE
+                    } else if mixed_brush_fixture || text_fixture {
                         MIXED_BRUSH_VIEWBOX_TOLERANCE
                     } else {
                         0.02
@@ -125,7 +152,12 @@ fn compare_filter_references(reference: &Document<'_>, generated: &Document<'_>,
     }
 }
 
-fn compare_texts(reference: &Document<'_>, generated: &Document<'_>, archive: &Path) {
+fn compare_texts(
+    reference: &Document<'_>,
+    generated: &Document<'_>,
+    archive: &Path,
+    matrix_tolerance: f64,
+) {
     let expected = text_group_map(reference);
     let actual = text_group_map(generated);
     assert_eq!(
@@ -176,7 +208,7 @@ fn compare_texts(reference: &Document<'_>, generated: &Document<'_>, archive: &P
         assert_eq!(actual_matrix.len(), 6);
         for index in 0..4 {
             assert!(
-                (expected_matrix[index] - actual_matrix[index]).abs() <= 0.000_01,
+                (expected_matrix[index] - actual_matrix[index]).abs() <= matrix_tolerance,
                 "text transform linear component {index} differs for {id}"
             );
         }

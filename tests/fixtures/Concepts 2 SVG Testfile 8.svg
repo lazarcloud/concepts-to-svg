@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="876.746pt" height="827.064pt" version="1.1" viewBox="-470.641 130.566 876.746 827.064">
+  <!--
+	Exported with Concepts: Smarter Sketching
+	Version: 2026.9.2 on Microsoft Windows NT 10.0.26300.0
+	https://concepts.app/
+	-->
+  <title>Concepts 2 SVG Testfile 8</title>
+  <desc>Drawing exported from Concepts: Smarter Sketching</desc>
+  <defs></defs>
+  <rect x="-470.641" y="130.566" width="876.746" height="827.064" stroke="none" fill="#000000"></rect>
+  <g id="Pen" opacity="1.000">
+    <path id="STROKE_01c78a70-3ba5-443d-9e05-7461e180a922" opacity="0.815" fill="none" stroke="#ffffff" stroke-width="3.309" stroke-opacity="0.815" stroke-linecap="round" stroke-linejoin="round" d="M -112.838 733.797 Q -112.949 733.615 -113.777 732.805 Q -114.604 731.995 -115.054 731.287 Q -115.504 730.579 -115.523 729.929 Q -115.542 729.280 -115.539 729.164 Q -115.536 729.047 -115.179 728.229 Q -114.821 727.410 -114.400 727.006 Q -113.978 726.602 -113.715 726.494 Q -113.452 726.385 -113.309 726.412 Q -113.166 726.439 -113.015 726.541 Q -112.865 726.643 -112.765 726.789 Q -112.665 726.936 -112.520 727.887 Q -112.375 728.838 -112.626 730.062 Q -112.877 731.286 -113.301 732.517 Q -113.726 733.747 -114.388 735.342 Q -115.051 736.937 -116.670 739.369 Q -118.288 741.801 -121.230 745.517 Q -124.171 749.233 -126.755 752.403 Q -129.339 755.574 -132.509 759.601 Q -135.680 763.628 -137.391 766.491 Q -139.102 769.354 -139.907 771.791 Q -140.712 774.228 -140.556 775.551 Q -140.401 776.874 -139.770 777.353 Q -139.140 777.831 -138.508 777.825 Q -137.876 777.820 -136.440 776.497 Q -135.005 775.174 -133.238 771.770 Q -131.472 768.367 -129.807 765.298 Q -128.142 762.229 -127.089 760.468 Q -126.037 758.707 -123.863 754.933 Q -121.689 751.160 -119.558 746.470 Q -117.427 741.780 -116.384 738.741 Q -115.342 735.701 -114.693 732.495 Q -114.045 729.288 -114.656 724.863 Q -115.267 720.438 -118.029 716.305 "></path>
+  </g>
+  <g id="Text" opacity="1.000">
+    <g id="TEXT_2a1f5330-522a-4e01-913b-663bbd11b5e3" opacity="1.000" transform="matrix(5.474326 0.000000 -0.000000 6.252106 -430.473602 633.397766)">
+      <text x="0" y="0" text-anchor="start" alignment-baseline="mathematical" font-size="24.000" font-weight="lighter" fill="#ffffff" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif">
+        <tspan x="0" dy="1.000em">Wow</tspan>
+      </text>
+    </g>
+    <g id="TEXT_08e3eac8-6722-406e-a14e-361bec737dc6" opacity="1.000" transform="matrix(-3.087721 0.000000 0.000000 5.041664 151.648651 733.180542)">
+      <text x="0" y="0" text-anchor="start" alignment-baseline="mathematical" font-size="24.000" font-weight="lighter" fill="#ffffff" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif">
+        <tspan x="0" dy="1.000em">test.</tspan>
+      </text>
+    </g>
+    <g id="TEXT_0e5d46b3-9320-48b3-9793-33566fa31a2e" opacity="1.000" transform="matrix(2.774002 -0.206630 0.206630 2.773999 -462.044983 882.458801)">
+      <text x="0" y="0" text-anchor="start" alignment-baseline="mathematical" font-size="24.000" font-weight="lighter" fill="#ffffff" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif">
+        <tspan x="0" dy="1.000em">perspective</tspan>
+      </text>
+    </g>
+  </g>
+</svg>

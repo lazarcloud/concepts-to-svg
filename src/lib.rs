@@ -39,6 +39,7 @@ struct Point {
 #[derive(Debug)]
 struct Stroke {
     id: String,
+    is_eraser: bool,
     color: String,
     width: f32,
     opacity: f32,
@@ -74,10 +75,18 @@ struct Text {
 }
 
 #[derive(Debug)]
+struct PdfPage {
+    width: f32,
+    height: f32,
+    transform: PlanarTransform,
+}
+
+#[derive(Debug)]
 enum DrawingObject {
     Stroke(Stroke),
     Image(EmbeddedImage),
     Text(Text),
+    PdfPage(PdfPage),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,9 +123,8 @@ impl PlanarTransform {
     }
 
     fn apply_svg(self, x: f32, y: f32) -> Result<(f32, f32)> {
-        if !self.is_affine() {
-            bail!("text has a projective transform that SVG text cannot represent");
-        }
+        // SVG text cannot represent projective matrices. Concepts' SVG export
+        // approximates transformed text with the affine portion of its matrix.
         let denominator = self.m44;
         let transformed = (
             (x * self.m11 - y * self.m21 + self.m41) / denominator,
@@ -330,9 +338,66 @@ where
     match object_type {
         3 | 4 | 5 | 6 | 9 | 10 | 11 | 15 | 4096 => parse_stroke(object).map(DrawingObject::Stroke),
         7 => parse_image(object, read_resource).map(DrawingObject::Image),
+        8 => parse_pdf_page(object, read_resource).map(DrawingObject::PdfPage),
         13 => parse_text(object).map(DrawingObject::Text),
         _ => bail!("unsupported drawing object type {object_type}"),
     }
+}
+
+fn parse_pdf_page<F>(object: &rmpv::Value, read_resource: &mut F) -> Result<PdfPage>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
+    let object_fields = array(object, "PDF page object")?;
+    let body = array(
+        required(object_fields, 1, "PDF page body")?,
+        "PDF page body",
+    )?;
+    let resource_id = extension(
+        required(body, 2, "PDF resource UUID")?,
+        5,
+        "PDF resource UUID",
+    )?;
+    if resource_id.len() != 16 {
+        bail!("PDF resource UUID has invalid length {}", resource_id.len());
+    }
+    let page_index = integer(required(body, 3, "PDF page index")?)?;
+    if page_index < 0 {
+        bail!("PDF page index is negative: {page_index}");
+    }
+    let path = format!("resources/{}.pdf", format_uuid(resource_id));
+    let _pdf = read_resource(&path)?;
+
+    let dimensions = extension(
+        required(body, 4, "PDF page dimensions")?,
+        1,
+        "PDF page dimensions",
+    )?;
+    if dimensions.len() != 8 {
+        bail!(
+            "PDF page dimensions have invalid length {}",
+            dimensions.len()
+        );
+    }
+    let width = f32::from_le_bytes(dimensions[0..4].try_into().expect("four-byte width"));
+    let height = f32::from_le_bytes(dimensions[4..8].try_into().expect("four-byte height"));
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        bail!("PDF page has invalid dimensions {width}x{height}");
+    }
+    let node = array(required(body, 1, "PDF page node")?, "PDF page node")?;
+    let transform = parse_transform(extension(
+        required(node, 7, "PDF page transform")?,
+        7,
+        "PDF page transform",
+    )?)?;
+
+    // Concepts' own SVG export omits imported PDF pages. Keep validating them
+    // so that neighboring vector objects and the page's export bounds survive.
+    Ok(PdfPage {
+        width,
+        height,
+        transform,
+    })
 }
 
 fn parse_text(object: &rmpv::Value) -> Result<Text> {
@@ -379,15 +444,15 @@ fn parse_text(object: &rmpv::Value) -> Result<Text> {
     let content = required(body, 2, "text content")?
         .as_str()
         .context("text content is not a UTF-8 string")?
+        // Concepts stores a trailing line break for text finalized with Enter,
+        // but omits that final break from its SVG export.
+        .trim_end_matches(['\r', '\n'])
         .to_owned();
     let transform = parse_transform(extension(
         required(node, 7, "text transform")?,
         7,
         "text transform",
     )?)?;
-    if !transform.is_affine() {
-        bail!("text has a projective transform that SVG text cannot represent");
-    }
 
     Ok(Text {
         id: format_uuid(id_bytes),
@@ -430,14 +495,21 @@ fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
         7,
         "stroke transform",
     )?)?;
-    let rgba = extension(required(color_fields, 2, "stroke RGBA")?, 4, "stroke RGBA")?;
-    if rgba.len() != 16 {
-        bail!("stroke RGBA has invalid length {}", rgba.len());
-    }
-    let channels = rgba
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
-        .collect::<Vec<_>>();
+    let rgba_value = required(color_fields, 2, "stroke RGBA")?;
+    let is_eraser = matches!(rgba_value, rmpv::Value::Nil);
+    let channels = if is_eraser {
+        // Concepts' mask-like stroke records may omit RGBA; its SVG export
+        // represents those records as white strokes.
+        vec![1.0; 4]
+    } else {
+        let rgba = extension(rgba_value, 4, "stroke RGBA")?;
+        if rgba.len() != 16 {
+            bail!("stroke RGBA has invalid length {}", rgba.len());
+        }
+        rgba.chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+            .collect::<Vec<_>>()
+    };
     if channels.iter().any(|channel| !channel.is_finite()) {
         bail!("stroke color contains a non-finite channel");
     }
@@ -461,6 +533,7 @@ fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
                 5 => 0.63,
                 6 => 0.5,
                 12 => 0.85,
+                13 => 0.63,
                 _ => 1.0,
             }
     };
@@ -499,6 +572,7 @@ fn parse_stroke(object: &rmpv::Value) -> Result<Stroke> {
 
     Ok(Stroke {
         id,
+        is_eraser,
         color,
         width,
         opacity,
@@ -597,7 +671,7 @@ where
     }
 
     let transform = parse_transform(extension(
-        required(body, 5, "image transform")?,
+        required(metadata, 7, "image transform")?,
         7,
         "image transform",
     )?)?;
@@ -716,6 +790,19 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
                         include_point(x, y);
                     }
                 }
+                DrawingObject::PdfPage(page) => {
+                    let half_width = page.width / 2.0;
+                    let half_height = page.height / 2.0;
+                    for (local_x, local_y) in [
+                        (-half_width, -half_height),
+                        (half_width, -half_height),
+                        (half_width, half_height),
+                        (-half_width, half_height),
+                    ] {
+                        let (x, y) = page.transform.apply(local_x, local_y)?;
+                        include_point(x, SVG_Y_FLIP - y);
+                    }
+                }
             }
         }
     }
@@ -745,7 +832,7 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
         .flat_map(|layer| layer.objects.iter())
         .filter_map(|object| match object {
             DrawingObject::Image(image) => Some(image),
-            DrawingObject::Stroke(_) | DrawingObject::Text(_) => None,
+            DrawingObject::Stroke(_) | DrawingObject::Text(_) | DrawingObject::PdfPage(_) => None,
         })
         .collect::<Vec<_>>();
     let has_filters = drawing.layers.iter().any(|layer| {
@@ -786,7 +873,13 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
     )?;
 
     for (layer_index, layer) in drawing.layers.iter().enumerate() {
-        if !layer.visible || layer.opacity <= 0.0 || layer.objects.is_empty() {
+        if !layer.visible
+            || layer.opacity <= 0.0
+            || !layer
+                .objects
+                .iter()
+                .any(|object| !matches!(object, DrawingObject::PdfPage(_)))
+        {
             continue;
         }
         let id = xml_escape(&layer_id(&layer.name, layer_index));
@@ -800,6 +893,7 @@ fn vector_svg(drawing: &Drawing) -> Result<String> {
                 DrawingObject::Stroke(stroke) => write_stroke(&mut svg, stroke)?,
                 DrawingObject::Image(image) => write_image(&mut svg, image)?,
                 DrawingObject::Text(text) => write_text(&mut svg, text)?,
+                DrawingObject::PdfPage(_) => {}
             }
         }
         writeln!(svg, "  </g>")?;
@@ -856,9 +950,6 @@ fn write_image(svg: &mut String, image: &EmbeddedImage) -> Result<()> {
 fn write_text(svg: &mut String, text: &Text) -> Result<()> {
     use std::fmt::Write as _;
 
-    if !text.transform.is_affine() {
-        bail!("text has a projective transform that SVG text cannot represent");
-    }
     let denominator = text.transform.m44;
     let matrix = [
         text.transform.m11 / denominator,
@@ -904,7 +995,7 @@ fn write_brush_filters(svg: &mut String, drawing: &Drawing) -> Result<()> {
         .flat_map(|layer| layer.objects.iter())
         .filter_map(|object| match object {
             DrawingObject::Stroke(stroke) => stroke.filter,
-            DrawingObject::Image(_) | DrawingObject::Text(_) => None,
+            DrawingObject::Image(_) | DrawingObject::Text(_) | DrawingObject::PdfPage(_) => None,
         })
         .collect::<HashSet<_>>();
     if filters.contains("FILTER_airbrush_24") {
@@ -933,18 +1024,26 @@ fn write_brush_filters(svg: &mut String, drawing: &Drawing) -> Result<()> {
 fn write_stroke(svg: &mut String, stroke: &Stroke) -> Result<()> {
     use std::fmt::Write as _;
     let opacity = format_num(stroke.opacity);
-    let id = format!("STROKE_{}", stroke.id);
+    let id = format!(
+        "{}_{}",
+        if stroke.is_eraser { "ERASER" } else { "STROKE" },
+        stroke.id
+    );
     if stroke.points.len() == 1 {
         let point = &stroke.points[0];
-        writeln!(
+        write!(
             svg,
-            "    <circle id=\"{id}\" opacity=\"{opacity}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"0.1\" stroke-opacity=\"{opacity}\" fill-opacity=\"{opacity}\" cx=\"{}\" cy=\"{}\" r=\"{}\" />",
+            "    <circle id=\"{id}\" opacity=\"{opacity}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"0.1\" stroke-opacity=\"{opacity}\" fill-opacity=\"{opacity}\" cx=\"{}\" cy=\"{}\" r=\"{}\"",
             stroke.color,
             stroke.color,
             format_num(point.x),
             format_num(point.y),
             format_num(stroke.width / 2.0)
         )?;
+        if let Some(filter) = stroke.filter {
+            write!(svg, " filter=\"url(#{filter})\"")?;
+        }
+        writeln!(svg, " />")?;
         return Ok(());
     }
     if stroke.points.len() < 2 {
